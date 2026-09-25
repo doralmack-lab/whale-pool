@@ -1,0 +1,17 @@
+# Render deploy for Whale Pool (free tier demo)
+services:
+  - type: web
+    name: whale-pool
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+    # NOTE: free tier has an ephemeral filesystem — the SQLite database resets
+    # on each deploy/restart. Fine for a demo. For production, attach a disk
+    # (paid) or switch DATABASE to a hosted Postgres.
