@@ -230,6 +230,13 @@ async function renderDashboard(query) {
       <h3>MY PROJECTS</h3>
       <div id="myProjs"><span style="color:var(--mut)">Loading…</span></div>
     </div>
+    <div class="panel">
+      <h3>CHANGE PASSWORD</h3>
+      <div id="pwMsg"></div>
+      <label>Current password</label><input type="password" id="pwCurrent" autocomplete="current-password">
+      <label>New password (8+ characters)</label><input type="password" id="pwNew" autocomplete="new-password">
+      <div style="margin-top:10px"><button class="btn small" id="pwChange">Change password</button></div>
+    </div>
   </div>`;
 
   const tp = document.getElementById('testPay');
@@ -261,6 +268,24 @@ async function renderDashboard(query) {
         <a class="btn small ghost" href="#/project/${p.id}">View</a>
       </div>`).join('')
     : '<span style="color:var(--mut)">No projects yet. Hit 10 referrals and bring your first idea to the pool.</span>';
+  const pwBtn = document.getElementById('pwChange');
+  if (pwBtn) pwBtn.addEventListener('click', async () => {
+    const msg = document.getElementById('pwMsg');
+    const cur = document.getElementById('pwCurrent').value;
+    const nw = document.getElementById('pwNew').value;
+    pwBtn.disabled = true; pwBtn.textContent = 'Saving…';
+    const r = await api('/api/me/password', {
+      method: 'POST', body: JSON.stringify({ current_password: cur, new_password: nw }),
+    });
+    pwBtn.disabled = false; pwBtn.textContent = 'Change password';
+    if (r.ok) {
+      msg.innerHTML = '<div class="okmsg" style="margin:0 0 8px">Password changed.</div>';
+      document.getElementById('pwCurrent').value = '';
+      document.getElementById('pwNew').value = '';
+    } else {
+      msg.innerHTML = `<div class="err" style="margin:0 0 8px">${esc(r.data.error || r.data.message || 'Could not change password')}</div>`;
+    }
+  });
 }
 
 /* ---------------- projects ---------------- */
@@ -536,12 +561,21 @@ async function renderAdmin(tab) {
     const r = await api('/api/admin/users');
     const users = r.ok ? r.data : [];
     body.innerHTML = `<div class="panel"><table class="tbl">
-      <tr><th>Member</th><th>Email</th><th>Status</th><th>Credits</th><th>Credited refs</th><th>Joined</th></tr>
+      <tr><th>Member</th><th>Email</th><th>Status</th><th>Credits</th><th>Credited refs</th><th>Joined</th><th>Admin</th></tr>
       ${users.map(x => `<tr><td><b>${esc(x.name)}</b>${x.is_admin ? ' 👑' : ''}</td><td>${esc(x.email)}</td>
         <td><span class="pill ${x.membership_status}">${esc(x.membership_status.toUpperCase())}</span></td>
         <td>${money(x.referral_credits_cents)}</td><td>${x.credited_referrals}</td>
-        <td style="color:var(--mut)">${esc((x.created_at || '').slice(0, 10))}</td></tr>`).join('')}
+        <td style="color:var(--mut)">${esc((x.created_at || '').slice(0, 10))}</td>
+        <td><button class="btn small ${x.is_admin ? 'ghost' : ''}" data-role="${x.id}" data-mk="${x.is_admin ? 0 : 1}">${x.is_admin ? 'Remove' : 'Make admin'}</button></td></tr>`).join('')}
     </table></div>`;
+    body.querySelectorAll('button[data-role]').forEach(b => b.addEventListener('click', async () => {
+      if (b.dataset.mk === '0' && !confirm('Remove admin access from this member?')) return;
+      b.disabled = true;
+      const r = await api(`/api/admin/users/${b.dataset.role}/role`, {
+        method: 'POST', body: JSON.stringify({ is_admin: b.dataset.mk === '1' }),
+      });
+      if (r.ok) renderAdmin('members'); else { alert(r.data.error || 'Failed'); b.disabled = false; }
+    }));
   } else {
     const r = await api('/api/admin/stats');
     const s = r.ok ? r.data : {};
