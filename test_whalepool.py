@@ -211,5 +211,92 @@ check("landing embeds promo video", "/static/whalepool-ad-30s.mp4" in js)
 check("promo video asset exists", os.path.exists("static/whalepool-ad-30s.mp4"))
 check("promo poster asset exists", os.path.exists("static/ad-poster.jpg"))
 
+
+# --- 14. wise payouts (sandbox-first, simulated without credentials) ---
+admin_tok2 = login("admin@t.test", "ChangedAdmin99")
+r = auth_get(tok, "/api/admin/payouts")
+check("payouts require admin", r.status_code == 403, r.status_code)
+r = auth_get(admin_tok2, "/api/admin/payouts")
+d = r.get_json()
+check("admin lists payouts", r.status_code == 200 and "payouts" in d, r.status_code)
+check("wise starts unconfigured/simulated", d["wise_mode"] == "simulated" and d["wise_configured"] is False, d["wise_mode"])
+
+r = auth_post(admin_tok2, "/api/admin/payouts/quote", {"amount_cents": 0})
+check("quote rejects non-positive amount", r.status_code == 400, r.status_code)
+r = auth_post(admin_tok2, "/api/admin/payouts/quote", {"amount_cents": 500000, "target_currency": "EUR"})
+d = r.get_json()
+check("quote simulated without credentials", r.status_code == 200 and d["mode"] == "simulated", r.status_code)
+
+with W.app.app_context():
+    db = W.get_db()
+    founder = db.execute("SELECT id FROM users WHERE email='founder@t.test'").fetchone()
+    proj = db.execute("SELECT id FROM projects LIMIT 1").fetchone()
+founder_id = founder["id"]
+project_id = proj["id"] if proj else None
+
+r = auth_post(admin_tok2, "/api/admin/payouts", {"kind": "bogus", "user_id": founder_id, "amount_cents": 100})
+check("payout rejects bad kind", r.status_code == 400, r.status_code)
+r = auth_post(admin_tok2, "/api/admin/payouts", {"user_id": 999999, "amount_cents": 100})
+check("payout rejects unknown user", r.status_code == 404, r.status_code)
+
+payload = {"kind": "loan_disbursement", "project_id": project_id, "user_id": founder_id,
+           "amount_cents": 500000, "target_currency": "USD", "recipient_details": {}}
+r = auth_post(admin_tok2, "/api/admin/payouts", payload)
+d = r.get_json()
+p = d.get("payout", {})
+check("payout created (simulated)", r.status_code == 201 and p.get("status") == "simulated",
+      (r.status_code, p.get("status")))
+check("payout has idempotency key", bool(p.get("customer_transaction_id")),
+      p.get("customer_transaction_id"))
+tid = p.get("wise_transfer_id")
+r = auth_post(admin_tok2, "/api/admin/payouts", payload)
+d2 = r.get_json()
+check("duplicate payout is idempotent", r.status_code == 200 and d2.get("duplicate") is True,
+      r.status_code)
+with W.app.app_context():
+    db = W.get_db()
+    n = db.execute("SELECT COUNT(*) c FROM wise_payouts").fetchone()["c"]
+    check("no double ledger row", n == 1, n)
+
+r = client.post("/api/webhooks/wise", json={"transfer_id": tid, "status": "delivered"})
+check("wise webhook accepted", r.status_code == 200, r.status_code)
+with W.app.app_context():
+    db = W.get_db()
+    st = db.execute("SELECT status FROM wise_payouts WHERE wise_transfer_id = ?", (tid,)).fetchone()["status"]
+    check("webhook updated payout status", st == "delivered", st)
+
+# wise client chain, fully mocked
+calls = []
+def fake_api(method, path, body=None):
+    calls.append((method, path))
+    if path.endswith("/quotes"):
+        return {"id": "q-1", "rate": 0.92, "fee": 1.5}
+    if path == "/v2/accounts":
+        return {"id": 42}
+    if path == "/v1/transfers":
+        assert body["customerTransactionId"] == "cid-1", body
+        return {"id": 777}
+    if path.endswith("/payments"):
+        return {"status": "COMPLETED"}
+    raise AssertionError(path)
+W.wise._api = fake_api
+W.wise.WISE_API_TOKEN = "tok"
+W.wise.WISE_PROFILE_ID = "123"
+res = W.wise.run_payout("loan_disbursement", 500000, "USD", "EUR", "Founder",
+                        {"iban": "DE123"}, "cid-1")
+check("wise chain: quote->recipient->transfer->fund",
+      [c[0] for c in calls] == ["POST", "POST", "POST", "POST"], calls)
+check("wise chain order", calls[0][1].endswith("/quotes") and calls[1][1] == "/v2/accounts"
+      and calls[2][1] == "/v1/transfers" and calls[3][1].endswith("/payments"), calls)
+check("wise transfer id captured", res["wise_transfer_id"] == "777", res)
+check("wise fee captured in cents", res["fee_cents"] == 150, res)
+W.wise.WISE_API_TOKEN = ""
+res = W.wise.run_payout("loan_disbursement", 500000, "USD", "USD", "Founder", {}, "cid-2")
+check("unconfigured wise stays simulated", res["status"] == "simulated", res)
+
+js = open("static/app.js").read()
+check("admin UI has payouts tab", 'data-t="payouts"' in js)
+check("payouts tab hits payouts API", "/api/admin/payouts" in js)
+
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 sys.exit(1 if failed else 0)
