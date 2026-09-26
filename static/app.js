@@ -72,10 +72,12 @@ function renderNav() {
 }
 
 /* ---------------- landing ---------------- */
-async function renderLanding() {
+async function renderLanding(query = {}) {
   const r = await api('/api/stats');
   const s = r.ok ? r.data : { members: 0, active_members: 0, total_pledged_cents: 0, projects_funded: 0 };
   setModeBadge(s.mode);
+  const ref = (query.ref || '').toUpperCase();
+  const joinHref = ref ? `#/join?ref=${encodeURIComponent(ref)}` : '#/join';
   app.innerHTML = `
   <div class="hero">
     <span class="kicker">COMMUNITY FUND · WEEKLY ROUNDS</span>
@@ -83,7 +85,7 @@ async function renderLanding() {
     <p class="lead">Whale Pool is the member-funded launchpad where everyday builders back each other's
     boldest ideas — reviewed by the community, refined together, funded together.</p>
     <div class="hero-ctas">
-      <a class="btn" href="#/join">Join the pool — $30/month</a>
+      <a class="btn" href="${joinHref}">Join the pool — $30/month</a>
       <a class="btn ghost" href="#/projects">Browse this week's projects</a>
     </div>
   </div>
@@ -118,7 +120,7 @@ async function renderLanding() {
       <div class="math-row"><span>Founder buyback · or annual dividend</span><b>cost + 10%</b></div>
       <div class="math-row"><span>New project rounds</span><b>Every week</b></div>
     </div>
-    <div style="text-align:center;margin-top:30px"><a class="btn" href="#/join">Claim your spot</a></div>
+    <div style="text-align:center;margin-top:30px"><a class="btn" href="${joinHref}">Claim your spot</a></div>
   </div>`;
 }
 
@@ -597,7 +599,7 @@ async function navigate() {
   renderNav();
   window.scrollTo(0, 0);
   const [page, arg] = segs;
-  if (!page) return renderLanding();
+  if (!page) return renderLanding(query);
   if (page === 'join') return renderJoin(query);
   if (page === 'login') return renderLogin();
   if (page === 'dashboard') return renderDashboard(query);
@@ -605,7 +607,7 @@ async function navigate() {
   if (page === 'project' && arg) return renderProjectDetail(arg, query);
   if (page === 'submit') return renderSubmit();
   if (page === 'admin') return renderAdmin(query.tab);
-  return renderLanding();
+  return renderLanding(query);
 }
 
 window.addEventListener('hashchange', navigate);
