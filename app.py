@@ -291,7 +291,7 @@ def make_referral_code(db):
 
 def referral_link_for(user, req):
     base = BASE_URL or req.host_url.rstrip("/")
-    return f"{base}/#/join?ref={user['referral_code']}"
+    return f"{base}/#/?ref={user['referral_code']}"
 
 
 def referral_stats(db, user_id):
