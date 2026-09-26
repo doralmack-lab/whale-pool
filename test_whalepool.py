@@ -159,5 +159,46 @@ import re
 js = open("static/app.js").read()
 check("no $25 membership copy left", "$25" not in js.replace("$250", ""))
 
+# --- 10. change password ---
+r = auth_post(tok, "/api/me/password", {"current_password": "password123", "new_password": "NewPass123"})
+check("change password ok", r.status_code == 200, r.status_code)
+tok = login("founder@t.test", "NewPass123")
+check("login works with new password", True)
+r = client.post("/api/auth/login", json={"email": "founder@t.test", "password": "password123"})
+check("old password rejected", r.status_code == 401, r.status_code)
+r = auth_post(tok, "/api/me/password", {"current_password": "wrong", "new_password": "Another123"})
+check("wrong current password -> 403", r.status_code == 403, r.status_code)
+r = auth_post(tok, "/api/me/password", {"current_password": "NewPass123", "new_password": "short"})
+check("short new password -> 400", r.status_code == 400, r.status_code)
+r = client.post("/api/me/password", json={"current_password": "x", "new_password": "LongEnough123"})
+check("change password unauthenticated -> 401", r.status_code == 401, r.status_code)
+
+# --- 11. admin role management ---
+ru = register("Roley", "roley@t.test"); rt = ru["token"]; rid = ru["user"]["id"]
+r = auth_post(admin_tok, f"/api/admin/users/{rid}/role", {"is_admin": True})
+check("admin can promote member", r.status_code == 200 and r.get_json()["is_admin"] is True, r.status_code)
+r = auth_get(rt, "/api/me")
+check("promoted user reports is_admin", r.get_json()["is_admin"] is True)
+r = auth_post(ref_toks[1], f"/api/admin/users/{rid}/role", {"is_admin": False})
+check("non-admin cannot change roles", r.status_code == 403, r.status_code)
+r = auth_post(admin_tok, f"/api/admin/users/{rid}/role", {"is_admin": False})
+check("admin can demote member", r.status_code == 200 and r.get_json()["is_admin"] is False, r.status_code)
+with W.app.app_context():
+    db = W.get_db()
+    admin_id = db.execute("SELECT id FROM users WHERE email='admin@t.test'").fetchone()["id"]
+r = auth_post(admin_tok, f"/api/admin/users/{admin_id}/role", {"is_admin": False})
+check("admin cannot demote self", r.status_code == 400, r.status_code)
+r = auth_post(admin_tok, "/api/admin/users/999999/role", {"is_admin": True})
+check("role change on missing user -> 404", r.status_code == 404, r.status_code)
+
+# --- 12. seed_admin upserts when the env password changes ---
+W.ADMIN_PASSWORD = "ChangedAdmin99"
+with W.app.app_context():
+    W.seed_admin()
+r = client.post("/api/auth/login", json={"email": "admin@t.test", "password": "ChangedAdmin99"})
+check("admin login works after env password change + reseed", r.status_code == 200, r.status_code)
+r = client.post("/api/auth/login", json={"email": "admin@t.test", "password": "Admin1234"})
+check("old admin password rejected after reseed", r.status_code == 401, r.status_code)
+
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 sys.exit(1 if failed else 0)
