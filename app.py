@@ -17,6 +17,12 @@ Run:
 Test mode: if STRIPE_SECRET_KEY is not set, the app runs in test mode with
 simulated payments (no real charges). Set STRIPE_SECRET_KEY (+ webhook
 secret) to go live.
+
+Wise payouts (money-out): founder loan disbursements and reserve releases go
+through Wise (sandbox-first). If WISE_API_TOKEN / WISE_PROFILE_ID are not set,
+payouts are simulated in the local ledger only. Set WISE_API_URL (default:
+https://api.wise-sandbox.com), WISE_API_TOKEN and WISE_PROFILE_ID to talk to
+Wise; use https://api.wise.com for production.
 """
 import hashlib
 import hmac
@@ -28,6 +34,8 @@ from datetime import datetime, timedelta, timezone, date
 from functools import wraps
 
 from flask import Flask, g, jsonify, request, send_from_directory
+
+import wise
 
 try:
     import jwt  # PyJWT
@@ -177,6 +185,23 @@ def init_db():
             project_id INTEGER NOT NULL REFERENCES projects(id),
             event_type TEXT NOT NULL,
             amount_cents INTEGER NOT NULL,
+            note TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS wise_payouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            project_id INTEGER REFERENCES projects(id),
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            amount_cents INTEGER NOT NULL,
+            source_currency TEXT NOT NULL DEFAULT 'USD',
+            target_currency TEXT NOT NULL DEFAULT 'USD',
+            recipient_name TEXT,
+            wise_quote_id TEXT,
+            wise_recipient_id TEXT,
+            wise_transfer_id TEXT,
+            customer_transaction_id TEXT UNIQUE NOT NULL,
+            status TEXT NOT NULL DEFAULT 'simulated',
             note TEXT,
             created_at TEXT NOT NULL
         );
@@ -470,6 +495,192 @@ def public_stats():
         "projects_funded": funded,
         "mode": "test" if TEST_MODE else "live",
     })
+
+
+# ------------------------------------------------------- wise payouts ----
+def _payout_row(r):
+    return {
+        "id": r["id"],
+        "kind": r["kind"],
+        "project_id": r["project_id"],
+        "project_title": r["project_title"],
+        "user_id": r["user_id"],
+        "recipient_name": r["recipient_name"],
+        "recipient_email": r["recipient_email"],
+        "amount_cents": r["amount_cents"],
+        "source_currency": r["source_currency"],
+        "target_currency": r["target_currency"],
+        "wise_mode": wise.wise_mode(),
+        "wise_transfer_id": r["wise_transfer_id"],
+        "customer_transaction_id": r["customer_transaction_id"],
+        "status": r["status"],
+        "note": r["note"],
+        "created_at": r["created_at"],
+    }
+
+
+@app.route("/api/admin/payouts")
+@admin_required
+def admin_payouts():
+    db = get_db()
+    rows = db.execute(
+        """SELECT p.*, pr.title AS project_title, u.email AS recipient_email
+           FROM wise_payouts p
+           LEFT JOIN projects pr ON pr.id = p.project_id
+           JOIN users u ON u.id = p.user_id
+           ORDER BY p.created_at DESC LIMIT 200"""
+    ).fetchall()
+    return jsonify({
+        "payouts": [_payout_row(r) for r in rows],
+        "wise_mode": wise.wise_mode(),
+        "wise_configured": wise.wise_configured(),
+    })
+
+
+@app.route("/api/admin/payouts/quote", methods=["POST"])
+@admin_required
+def admin_payout_quote():
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        amount_cents = int(data.get("amount_cents", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "amount_cents must be an integer"}), 400
+    if amount_cents <= 0:
+        return jsonify({"error": "amount_cents must be positive"}), 400
+    src = (data.get("source_currency") or "USD").upper()
+    dst = (data.get("target_currency") or "USD").upper()
+    if not wise.wise_configured():
+        return jsonify({
+            "mode": "simulated",
+            "source_currency": src,
+            "target_currency": dst,
+            "source_amount": round(amount_cents / 100, 2),
+            "rate": 1.0 if src == dst else None,
+            "note": "WISE_API_TOKEN not set — simulated quote",
+        })
+    try:
+        q = wise.create_quote(src, dst, amount_cents)
+    except wise.WiseError as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"mode": wise.wise_mode(), "quote": q})
+
+
+@app.route("/api/admin/payouts", methods=["POST"])
+@admin_required
+def admin_payout_create():
+    data = request.get_json(force=True, silent=True) or {}
+    kind = (data.get("kind") or "loan_disbursement").strip()
+    if kind not in ("loan_disbursement", "reserve_release"):
+        return jsonify({"error": "kind must be loan_disbursement or reserve_release"}), 400
+    try:
+        amount_cents = int(data.get("amount_cents", 0))
+        user_id = int(data.get("user_id", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "amount_cents and user_id must be integers"}), 400
+    if amount_cents <= 0 or user_id <= 0:
+        return jsonify({"error": "amount_cents and user_id must be positive"}), 400
+    project_id = data.get("project_id")
+    try:
+        project_id = int(project_id) if project_id else None
+    except (TypeError, ValueError):
+        return jsonify({"error": "project_id must be an integer"}), 400
+    target_currency = (data.get("target_currency") or "USD").upper()
+    source_currency = (data.get("source_currency") or "USD").upper()
+    recipient_name = (data.get("recipient_name") or "").strip()
+    recipient_details = data.get("recipient_details") or {}
+    if not isinstance(recipient_details, dict):
+        return jsonify({"error": "recipient_details must be an object"}), 400
+
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user is None:
+        return jsonify({"error": "user not found"}), 404
+    if not recipient_name:
+        recipient_name = user["name"]
+    if project_id is not None:
+        proj = db.execute("SELECT id FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if proj is None:
+            return jsonify({"error": "project not found"}), 404
+
+    # Idempotency key: same kind+project+user+amount never pays twice.
+    cid = f"whalepool-{kind}-{project_id or 0}-{user_id}-{amount_cents}-{target_currency}"
+    existing = db.execute(
+        "SELECT * FROM wise_payouts WHERE customer_transaction_id = ?", (cid,)
+    ).fetchone()
+    if existing is not None:
+        return jsonify({"ok": True, "duplicate": True,
+                        "payout": _payout_row(_payout_with_joins(db, existing["id"]))})
+
+    try:
+        result = wise.run_payout(
+            kind=kind,
+            amount_cents=amount_cents,
+            source_currency=source_currency,
+            target_currency=target_currency,
+            recipient_name=recipient_name,
+            recipient_details=recipient_details,
+            customer_transaction_id=cid,
+            reference=f"Whale Pool {kind.replace('_', ' ')}",
+        )
+    except wise.WiseError as e:
+        return jsonify({"error": str(e)}), 502
+
+    cur = db.execute(
+        """INSERT INTO wise_payouts
+           (kind, project_id, user_id, amount_cents, source_currency,
+            target_currency, recipient_name, wise_quote_id, wise_recipient_id,
+            wise_transfer_id, customer_transaction_id, status, note, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (kind, project_id, user_id, amount_cents, source_currency,
+         target_currency, recipient_name, result.get("wise_quote_id"),
+         result.get("wise_recipient_id"), result.get("wise_transfer_id"),
+         cid, result.get("status", "created"),
+         result.get("note"), now_iso()),
+    )
+    db.commit()
+    row = _payout_with_joins(db, cur.lastrowid)
+    out = _payout_row(row)
+    out["wise_result"] = {k: v for k, v in result.items() if k != "note"}
+    return jsonify({"ok": True, "payout": out}), 201
+
+
+def _payout_with_joins(db, payout_id):
+    return db.execute(
+        """SELECT p.*, pr.title AS project_title, u.email AS recipient_email
+           FROM wise_payouts p
+           LEFT JOIN projects pr ON pr.id = p.project_id
+           JOIN users u ON u.id = p.user_id
+           WHERE p.id = ?""",
+        (payout_id,),
+    ).fetchone()
+
+
+@app.route("/api/webhooks/wise", methods=["POST"])
+def wise_webhook():
+    # Shared-secret check. Production hardening: verify Wise's RSA
+    # X-Signature-SHA256 header against their published public key.
+    secret = wise.WISE_WEBHOOK_SECRET
+    if secret:
+        got = request.headers.get("X-Wise-Webhook-Secret", "")
+        if not hmac.compare_digest(got, secret):
+            return jsonify({"error": "bad webhook secret"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    transfer_id = str(data.get("transfer_id") or data.get("resourceId") or "")
+    status = (data.get("status") or data.get("currentState") or "").lower()
+    if not transfer_id:
+        return jsonify({"error": "missing transfer id"}), 400
+    db = get_db()
+    row = db.execute(
+        "SELECT id FROM wise_payouts WHERE wise_transfer_id = ?", (transfer_id,)
+    ).fetchone()
+    if row is None:
+        return jsonify({"ok": True, "known": False})
+    if status:
+        db.execute("UPDATE wise_payouts SET status = ? WHERE id = ?",
+                   (status, row["id"]))
+        db.commit()
+    return jsonify({"ok": True, "known": True, "status": status})
+
 
 
 # ---- auth ----
