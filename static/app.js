@@ -533,6 +533,7 @@ async function renderAdmin(tab) {
     <div class="tabs">
       <button data-t="review" class="${tab === 'review' ? 'on' : ''}">Review queue</button>
       <button data-t="members" class="${tab === 'members' ? 'on' : ''}">Members</button>
+      <button data-t="payouts" class="${tab === 'payouts' ? 'on' : ''}">Payouts</button>
       <button data-t="stats" class="${tab === 'stats' ? 'on' : ''}">Stats</button>
     </div>
     <div id="tabBody"><span style="color:var(--mut)">Loading…</span></div>
@@ -585,6 +586,71 @@ async function renderAdmin(tab) {
       });
       if (r.ok) renderAdmin('members'); else { alert(r.data.error || 'Failed'); b.disabled = false; }
     }));
+  } else if (tab === 'payouts') {
+    const r = await api('/api/admin/payouts');
+    const d = r.ok ? r.data : { payouts: [], wise_mode: 'simulated', wise_configured: false };
+    const rows = (d.payouts || []).map(p => `
+      <tr><td>${esc(p.kind.replace(/_/g, ' '))}</td>
+        <td>${esc(p.recipient_name || '')}<br><span style="color:var(--mut);font-size:12px">${esc(p.recipient_email || '')}</span></td>
+        <td>${money(p.amount_cents)} ${esc(p.target_currency)}</td>
+        <td><span class="badge">${esc(p.status)}</span></td>
+        <td style="color:var(--mut);font-size:12px">${esc(p.created_at || '').slice(0, 10)}</td></tr>`).join('');
+    body.innerHTML = `
+      <div class="panel" style="margin-bottom:12px">
+        <div class="rowflex"><b>Wise payouts</b>
+          <span class="badge">wise: ${esc(d.wise_mode)}${d.wise_configured ? '' : ' (no credentials — simulated)'}</span></div>
+        <p style="color:var(--mut);font-size:13px">Founder loan disbursements and reserve releases. Money-in stays on Stripe; money-out goes through Wise.
+        ${d.wise_configured ? '' : 'Set WISE_API_TOKEN, WISE_PROFILE_ID (and WISE_API_URL) in Render to use the real Wise sandbox.'}</p>
+        <table style="width:100%;font-size:14px"><thead><tr>
+          <th style="text-align:left">Kind</th><th style="text-align:left">Recipient</th>
+          <th style="text-align:left">Amount</th><th style="text-align:left">Status</th><th style="text-align:left">Date</th>
+        </tr></thead><tbody>${rows || '<tr><td colspan="5" style="color:var(--mut)">No payouts yet.</td></tr>'}</tbody></table>
+      </div>
+      <div class="panel">
+        <b>New payout</b>
+        <div class="rowflex" style="margin-top:8px">
+          <input id="po-user" type="number" placeholder="User ID (founder)" style="width:150px">
+          <select id="po-kind"><option value="loan_disbursement">Loan disbursement</option><option value="reserve_release">Reserve release</option></select>
+          <input id="po-project" type="number" placeholder="Project ID (optional)" style="width:150px">
+        </div>
+        <div class="rowflex" style="margin-top:8px">
+          <input id="po-amount" type="number" placeholder="Amount (cents)" style="width:150px">
+          <input id="po-cur" placeholder="Target currency" value="USD" style="width:110px">
+          <input id="po-name" placeholder="Recipient name (defaults to user)" style="flex:1;min-width:180px">
+        </div>
+        <textarea id="po-details" rows="2" placeholder='Recipient bank details as JSON, e.g. {"iban":"DE89370400440532013000"}' style="width:100%;margin-top:8px"></textarea>
+        <div class="rowflex" style="margin-top:8px">
+          <button class="btn small ghost" id="po-quote">Get quote</button>
+          <button class="btn small" id="po-create">Create payout</button>
+          <span id="po-msg" style="font-size:13px;color:var(--mut)"></span>
+        </div>
+      </div>`;
+    const msg = t => { body.querySelector('#po-msg').textContent = t; };
+    body.querySelector('#po-quote').addEventListener('click', async () => {
+      const amount_cents = parseInt(body.querySelector('#po-amount').value, 10);
+      const target_currency = body.querySelector('#po-cur').value || 'USD';
+      const qr = await api('/api/admin/payouts/quote', { method: 'POST',
+        body: JSON.stringify({ amount_cents, target_currency }) });
+      msg(qr.ok ? `Quote (${qr.data.mode}): ${JSON.stringify(qr.data.quote || qr.data).slice(0, 160)}`
+                : (qr.data.error || 'Quote failed'));
+    });
+    body.querySelector('#po-create').addEventListener('click', async () => {
+      let details = {};
+      const raw = body.querySelector('#po-details').value.trim();
+      if (raw) { try { details = JSON.parse(raw); } catch (e) { msg('Recipient details must be valid JSON'); return; } }
+      const payload = {
+        kind: body.querySelector('#po-kind').value,
+        user_id: parseInt(body.querySelector('#po-user').value, 10),
+        project_id: parseInt(body.querySelector('#po-project').value, 10) || null,
+        amount_cents: parseInt(body.querySelector('#po-amount').value, 10),
+        target_currency: body.querySelector('#po-cur').value || 'USD',
+        recipient_name: body.querySelector('#po-name').value,
+        recipient_details: details,
+      };
+      const b = body.querySelector('#po-create'); b.disabled = true;
+      const cr = await api('/api/admin/payouts', { method: 'POST', body: JSON.stringify(payload) });
+      if (cr.ok) { renderAdmin('payouts'); } else { msg(cr.data.error || 'Payout failed'); b.disabled = false; }
+    });
   } else {
     const r = await api('/api/admin/stats');
     const s = r.ok ? r.data : {};
