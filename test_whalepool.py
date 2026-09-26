@@ -200,5 +200,13 @@ check("admin login works after env password change + reseed", r.status_code == 2
 r = client.post("/api/auth/login", json={"email": "admin@t.test", "password": "Admin1234"})
 check("old admin password rejected after reseed", r.status_code == 401, r.status_code)
 
+# --- 13. referral link lands on the main page, code carried through ---
+r = auth_get(tok, "/api/me")
+me = r.get_json()
+check("referral link points at landing page", "/#/?ref=" in me["referral_link"], me["referral_link"])
+check("referral link carries own code", me["referral_link"].endswith("?ref=" + me["referral_code"]), me["referral_link"])
+js = open("static/app.js").read()
+check("landing join buttons carry ref", 'href="${joinHref}"' in js)
+
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 sys.exit(1 if failed else 0)
