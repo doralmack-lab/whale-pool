@@ -207,6 +207,9 @@ check("referral link points at landing page", "/#/?ref=" in me["referral_link"],
 check("referral link carries own code", me["referral_link"].endswith("?ref=" + me["referral_code"]), me["referral_link"])
 js = open("static/app.js").read()
 check("landing join buttons carry ref", 'href="${joinHref}"' in js)
+check("landing embeds promo video", "/static/whalepool-ad-30s.mp4" in js)
+check("promo video asset exists", os.path.exists("static/whalepool-ad-30s.mp4"))
+check("promo poster asset exists", os.path.exists("static/ad-poster.jpg"))
 
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 sys.exit(1 if failed else 0)
