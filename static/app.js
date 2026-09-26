@@ -89,6 +89,13 @@ async function renderLanding(query = {}) {
       <a class="btn ghost" href="#/projects">Browse this week's projects</a>
     </div>
   </div>
+  <div class="section">
+    <h2>Watch the film</h2>
+    <p class="sub">Thirty seconds. Turn your sound on.</p>
+    <video controls preload="metadata" poster="/static/ad-poster.jpg" style="width:100%;max-width:880px;border-radius:12px;display:block;margin:0 auto">
+      <source src="/static/whalepool-ad-30s.mp4" type="video/mp4">
+    </video>
+  </div>
   <div class="stats">
     <div class="stat"><div class="n">${s.members}</div><div class="l">MEMBERS</div></div>
     <div class="stat"><div class="n">${s.active_members}</div><div class="l">ACTIVE</div></div>
