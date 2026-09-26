@@ -532,6 +532,26 @@ def me():
     return jsonify(out)
 
 
+@app.route("/api/me/password", methods=["POST"])
+@auth_required
+def change_password():
+    data = request.get_json(force=True, silent=True) or {}
+    current = data.get("current_password") or ""
+    new = data.get("new_password") or ""
+    if len(new) < 8:
+        return jsonify({"error": "new password must be at least 8 characters"}), 400
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE id = ?", (g.current_user["id"],)).fetchone()
+    if not verify_password(current, user["password_hash"]):
+        return jsonify({"error": "current password is incorrect"}), 403
+    db.execute(
+        "UPDATE users SET password_hash = ? WHERE id = ?",
+        (hash_password(new), user["id"]),
+    )
+    db.commit()
+    return jsonify({"ok": True})
+
+
 # ---- billing ----
 @app.route("/api/billing/status")
 @auth_required
@@ -1029,6 +1049,22 @@ def admin_users():
     return jsonify(out)
 
 
+@app.route("/api/admin/users/<int:user_id>/role", methods=["POST"])
+@admin_required
+def admin_set_role(user_id):
+    data = request.get_json(force=True, silent=True) or {}
+    make_admin = bool(data.get("is_admin"))
+    db = get_db()
+    target = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if target is None:
+        return jsonify({"error": "user not found"}), 404
+    if target["id"] == g.current_user["id"] and not make_admin:
+        return jsonify({"error": "you cannot remove your own admin access"}), 400
+    db.execute("UPDATE users SET is_admin = ? WHERE id = ?", (1 if make_admin else 0, user_id))
+    db.commit()
+    return jsonify({"ok": True, "is_admin": make_admin})
+
+
 @app.route("/api/admin/stats")
 @admin_required
 def admin_stats():
@@ -1051,7 +1087,16 @@ def seed_admin():
     if not (ADMIN_EMAIL and ADMIN_PASSWORD):
         return
     db = get_db()
-    if db.execute("SELECT 1 FROM users WHERE email = ?", (ADMIN_EMAIL,)).fetchone():
+    existing = db.execute("SELECT id FROM users WHERE email = ?", (ADMIN_EMAIL,)).fetchone()
+    if existing:
+        # Upsert: keep the env-configured admin account in sync so a changed
+        # ADMIN_PASSWORD (or a restored admin flag) takes effect on redeploy.
+        db.execute(
+            "UPDATE users SET password_hash = ?, is_admin = 1 WHERE id = ?",
+            (hash_password(ADMIN_PASSWORD), existing["id"]),
+        )
+        db.commit()
+        print(f"Synced admin user {ADMIN_EMAIL}")
         return
     db.execute(
         """INSERT INTO users (name, email, password_hash, referral_code, is_admin, created_at)
