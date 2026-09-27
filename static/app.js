@@ -214,6 +214,14 @@ async function renderDashboard(query) {
             ? `<button class="btn small" id="testPay">Test pay $30 (no real charge)</button>`
             : `<button class="btn small" id="checkout">Pay $30/month with Stripe</button>`
         ) : `<button class="btn small ghost" id="manageBtn" disabled>Managed via Stripe</button>`}
+        ${bill.bank_transfer && bill.bank_transfer.account_details ? `
+        <div style="margin-top:12px;padding:10px;border:1px dashed var(--line);border-radius:8px;font-size:13px;color:var(--mut)">
+          <b style="color:var(--gold)">Pay by bank transfer (no fees):</b>
+          send <b>${money2(bill.bank_transfer.amount_cents)}</b>/month to
+          <b>${esc(bill.bank_transfer.account_details)}</b>
+          with reference <b>${esc(bill.bank_transfer.reference)}</b>.
+          Set it as a recurring transfer in BOB online banking — your membership activates once the payment clears reconciliation.
+        </div>` : ''}
       </div>
       <div class="panel">
         <h3>YOUR REFERRAL LINK</h3>
@@ -534,6 +542,7 @@ async function renderAdmin(tab) {
       <button data-t="review" class="${tab === 'review' ? 'on' : ''}">Review queue</button>
       <button data-t="members" class="${tab === 'members' ? 'on' : ''}">Members</button>
       <button data-t="payouts" class="${tab === 'payouts' ? 'on' : ''}">Payouts</button>
+      <button data-t="bank" class="${tab === 'bank' ? 'on' : ''}">Bank</button>
       <button data-t="stats" class="${tab === 'stats' ? 'on' : ''}">Stats</button>
     </div>
     <div id="tabBody"><span style="color:var(--mut)">Loading…</span></div>
@@ -650,6 +659,116 @@ async function renderAdmin(tab) {
       const b = body.querySelector('#po-create'); b.disabled = true;
       const cr = await api('/api/admin/payouts', { method: 'POST', body: JSON.stringify(payload) });
       if (cr.ok) { renderAdmin('payouts'); } else { msg(cr.data.error || 'Payout failed'); b.disabled = false; }
+    });
+  } else if (tab === 'bank') {
+    const [duesR, txR] = await Promise.all([
+      api('/api/admin/bank/dues'),
+      api('/api/admin/bank/transactions?status=needs_review'),
+    ]);
+    const dues = duesR.ok ? duesR.data : [];
+    let txs = txR.ok ? txR.data : [];
+    let txFilter = 'needs_review';
+    body.innerHTML = `
+      <div class="panel" style="margin-bottom:12px">
+        <div class="rowflex"><b>Import BOB statement</b><span class="badge">BSD · recurring transfers</span></div>
+        <p style="color:var(--mut);font-size:13px">Download the whale account statement as CSV from BOB online banking and upload it here.
+        Credits are matched automatically when the member's referral code (or member ID) is in the payment reference.
+        Re-uploading the same file is safe — duplicates are skipped.</p>
+        <div class="rowflex" style="margin-top:8px">
+          <input type="file" id="bankFile" accept=".csv">
+          <button class="btn small" id="bankUpload">Upload &amp; reconcile</button>
+          <span id="bankMsg" style="font-size:13px;color:var(--mut)"></span>
+        </div>
+      </div>
+      <div class="panel" style="margin-bottom:12px">
+        <b>Dues — overdue &amp; due within 7 days</b> <span class="badge">${dues.length}</span>
+        <table style="width:100%;font-size:14px;margin-top:8px"><thead><tr>
+          <th style="text-align:left">Member</th><th style="text-align:left">Status</th>
+          <th style="text-align:left">Period ends</th><th style="text-align:left">Last paid</th>
+        </tr></thead><tbody>
+        ${dues.length ? dues.map(d => `<tr><td><b>${esc(d.name)}</b><br><span style="color:var(--mut);font-size:12px">${esc(d.email)}</span></td>
+          <td><span class="pill ${esc(d.membership_status)}">${esc(d.membership_status.toUpperCase())}</span></td>
+          <td style="color:var(--mut)">${esc((d.membership_period_end || '—').slice(0, 10))}</td>
+          <td style="color:var(--mut)">${esc((d.last_paid_at || 'never').slice(0, 10))}${d.last_payment_status ? ` (${esc(d.last_payment_status)})` : ''}</td></tr>`).join('')
+          : '<tr><td colspan="4" style="color:var(--mut)">Everyone is paid up. 🎉</td></tr>'}
+        </tbody></table>
+      </div>
+      <div class="panel">
+        <div class="rowflex"><b>Statement transactions</b>
+          <span>${['needs_review', 'pending', 'matched', 'ignored'].map(f =>
+            `<button class="btn small ${f === txFilter ? '' : 'ghost'}" data-txf="${f}">${f.replace('_', ' ')}</button>`).join(' ')}</span></div>
+        <div id="txTable" style="margin-top:8px"></div>
+      </div>`;
+    const renderTx = () => {
+      const el = body.querySelector('#txTable');
+      el.innerHTML = txs.length ? `<table style="width:100%;font-size:13px"><thead><tr>
+        <th style="text-align:left">Date</th><th style="text-align:left">Description</th>
+        <th style="text-align:left">Amount</th><th style="text-align:left">Member</th><th style="text-align:left">Action</th>
+      </tr></thead><tbody>${txs.map(t => `<tr>
+        <td style="color:var(--mut);white-space:nowrap">${esc(t.posted_date)}</td>
+        <td>${esc(t.description)}${t.reference ? `<br><span style="color:var(--mut);font-size:12px">ref: ${esc(t.reference)}</span>` : ''}</td>
+        <td style="white-space:nowrap">${money2(t.amount_cents)} ${esc(t.currency)}</td>
+        <td>${t.matched_name ? `<b>${esc(t.matched_name)}</b>`
+          : (t.suggested_name ? `<span style="color:var(--gold)">suggested: ${esc(t.suggested_name)}</span>`
+          : '<span style="color:var(--mut)">—</span>')}</td>
+        <td style="white-space:nowrap">${t.status === 'needs_review'
+          ? `<button class="btn small" data-confirm="${t.id}" data-uid="${t.suggested_user_id}">Confirm: ${esc(t.suggested_name)}</button>
+             <button class="btn small ghost" data-ignore="${t.id}">Ignore</button>`
+          : t.status === 'pending'
+          ? `<input data-email="${t.id}" placeholder="member email" style="width:160px">
+             <button class="btn small" data-match="${t.id}">Match</button>
+             <button class="btn small ghost" data-ignore="${t.id}">Ignore</button>`
+          : `<span class="badge">${esc(t.status)}</span>`}</td>
+      </tr>`).join('')}</tbody></table>`
+        : '<p style="color:var(--mut)">Nothing here.</p>';
+      el.querySelectorAll('button[data-confirm]').forEach(b => b.addEventListener('click', async () => {
+        b.disabled = true;
+        const r = await api(`/api/admin/bank/transactions/${b.dataset.confirm}/match`, {
+          method: 'POST', body: JSON.stringify({ user_id: parseInt(b.dataset.uid, 10) }) });
+        if (r.ok) { txs = txs.filter(t => t.id !== parseInt(b.dataset.confirm, 10)); renderTx(); }
+        else { alert(r.data.error || 'Match failed'); b.disabled = false; }
+      }));
+      el.querySelectorAll('button[data-match]').forEach(b => b.addEventListener('click', async () => {
+        const em = el.querySelector(`input[data-email="${b.dataset.match}"]`).value.trim();
+        if (!em) { alert('Enter the member email first'); return; }
+        b.disabled = true;
+        const r = await api(`/api/admin/bank/transactions/${b.dataset.match}/match`, {
+          method: 'POST', body: JSON.stringify({ email: em }) });
+        if (r.ok) { txs = txs.filter(t => t.id !== parseInt(b.dataset.match, 10)); renderTx(); }
+        else { alert(r.data.error || 'Match failed'); b.disabled = false; }
+      }));
+      el.querySelectorAll('button[data-ignore]').forEach(b => b.addEventListener('click', async () => {
+        b.disabled = true;
+        const r = await api(`/api/admin/bank/transactions/${b.dataset.ignore}/ignore`, { method: 'POST' });
+        if (r.ok) { txs = txs.filter(t => t.id !== parseInt(b.dataset.ignore, 10)); renderTx(); }
+        else { alert(r.data.error || 'Ignore failed'); b.disabled = false; }
+      }));
+    };
+    renderTx();
+    body.querySelectorAll('button[data-txf]').forEach(b => b.addEventListener('click', async () => {
+      txFilter = b.dataset.txf;
+      body.querySelectorAll('button[data-txf]').forEach(x => x.classList.toggle('ghost', x.dataset.txf !== txFilter));
+      const r = await api('/api/admin/bank/transactions?status=' + txFilter);
+      txs = r.ok ? r.data : [];
+      renderTx();
+    }));
+    body.querySelector('#bankUpload').addEventListener('click', async () => {
+      const inp = body.querySelector('#bankFile');
+      const msgEl = body.querySelector('#bankMsg');
+      const btn = body.querySelector('#bankUpload');
+      if (!inp.files.length) { msgEl.textContent = 'Choose a CSV file first.'; return; }
+      btn.disabled = true; msgEl.textContent = 'Importing…';
+      const fd = new FormData();
+      fd.append('file', inp.files[0]);
+      try {
+        const res = await fetch('/api/admin/bank/import', {
+          method: 'POST', headers: { 'Authorization': 'Bearer ' + store.token }, body: fd });
+        const d = await res.json();
+        if (res.ok) {
+          msgEl.textContent = `Imported ${d.new_transactions} new (${d.auto_matched} auto-matched, ${d.duplicates_skipped} duplicates skipped).`;
+          renderAdmin('bank');
+        } else { msgEl.textContent = d.error || 'Import failed'; btn.disabled = false; }
+      } catch (e) { msgEl.textContent = 'Upload failed: ' + e.message; btn.disabled = false; }
     });
   } else {
     const r = await api('/api/admin/stats');
