@@ -24,10 +24,13 @@ payouts are simulated in the local ledger only. Set WISE_API_URL (default:
 https://api.wise-sandbox.com), WISE_API_TOKEN and WISE_PROFILE_ID to talk to
 Wise; use https://api.wise.com for production.
 """
+import csv
 import hashlib
 import hmac
+import io
 import json
 import os
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone, date
@@ -57,6 +60,7 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 BASE_URL = os.environ.get("BASE_URL", "").strip().rstrip("/")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+BOB_ACCOUNT_DETAILS = os.environ.get("BOB_ACCOUNT_DETAILS", "").strip()
 
 TEST_MODE = not bool(STRIPE_SECRET_KEY)
 if stripe is not None and STRIPE_SECRET_KEY:
@@ -203,6 +207,30 @@ def init_db():
             customer_transaction_id TEXT UNIQUE NOT NULL,
             status TEXT NOT NULL DEFAULT 'simulated',
             note TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS bank_imports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            imported_by INTEGER REFERENCES users(id),
+            txn_count INTEGER NOT NULL DEFAULT 0,
+            new_count INTEGER NOT NULL DEFAULT 0,
+            matched_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS bank_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_id INTEGER NOT NULL REFERENCES bank_imports(id),
+            posted_date TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            reference TEXT NOT NULL DEFAULT '',
+            amount_cents INTEGER NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'BSD',
+            fingerprint TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'pending',
+            matched_user_id INTEGER REFERENCES users(id),
+            suggested_user_id INTEGER REFERENCES users(id),
+            payment_id INTEGER REFERENCES payments(id),
             created_at TEXT NOT NULL
         );
         """
@@ -368,7 +396,8 @@ def credit_referrer_for(db, user_id):
 
 
 def activate_membership(db, user_id, stripe_customer_id=None, stripe_subscription_id=None,
-                        stripe_payment_id=None, simulated=False):
+                        stripe_payment_id=None, simulated=False, period_days=30,
+                        amount_cents=None, payment_status=None, payment_reference=None):
     user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     start = datetime.now(timezone.utc)
     try:
@@ -377,7 +406,7 @@ def activate_membership(db, user_id, stripe_customer_id=None, stripe_subscriptio
         current_end = None
     if current_end and current_end > start:
         start = current_end
-    end = start + timedelta(days=30)
+    end = start + timedelta(days=period_days)
     db.execute(
         """UPDATE users SET membership_status = 'active',
            membership_period_end = ?,
@@ -386,12 +415,15 @@ def activate_membership(db, user_id, stripe_customer_id=None, stripe_subscriptio
            WHERE id = ?""",
         (end.isoformat(), stripe_customer_id, stripe_subscription_id, user_id),
     )
+    status = payment_status or ("simulated" if simulated else "succeeded")
+    reference = payment_reference if payment_reference is not None else stripe_payment_id
+    amt = MONTHLY_PRICE_CENTS if amount_cents is None else amount_cents
     db.execute(
         """INSERT INTO payments (user_id, amount_cents, status, stripe_payment_id,
            period_start, period_end, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (user_id, MONTHLY_PRICE_CENTS, "simulated" if simulated else "succeeded",
-         stripe_payment_id, start.isoformat(), end.isoformat(), now_iso()),
+        (user_id, amt, status, reference,
+         start.isoformat(), end.isoformat(), now_iso()),
     )
     db.commit()
     return credit_referrer_for(db, user_id)
@@ -774,6 +806,12 @@ def billing_status():
         "membership_status": user["membership_status"],
         "membership_period_end": user["membership_period_end"],
         "monthly_price_cents": MONTHLY_PRICE_CENTS,
+        "bank_transfer": {
+            "enabled": True,
+            "amount_cents": MONTHLY_PRICE_CENTS,
+            "reference": user["referral_code"],
+            "account_details": BOB_ACCOUNT_DETAILS or None,
+        },
     })
 
 
@@ -862,6 +900,366 @@ def stripe_webhook():
             if user:
                 activate_membership(db, user["id"])
     return jsonify({"received": True})
+
+
+# --------------------------------------- bank transfer reconciliation ----
+# Members pay $30/month by recurring transfer into the Whale Pool business
+# account at Bank of The Bahamas, using their referral code as the payment
+# reference. BOB offers no transaction API, so the admin downloads the
+# statement as CSV and imports it here; payments are auto-matched by
+# reference and memberships are activated exactly like Stripe payments.
+
+class BankStatementError(Exception):
+    pass
+
+
+def _norm_header(h):
+    return re.sub(r"[^a-z0-9]", "", (h or "").lower())
+
+
+_BANK_COLS = {
+    "date": {"date", "postingdate", "posteddate", "valuedate", "transactiondate",
+             "trandate", "effectivedate", "valuedt"},
+    "description": {"description", "narrative", "narration", "details", "particulars",
+                    "memo", "transactiondetails", "transactiondescription", "detail"},
+    "reference": {"reference", "referenceno", "ref", "transactionreference",
+                  "remarks", "chequenumber", "chqno"},
+    "credit": {"credit", "creditamount", "deposits", "amountcredited", "paidin", "in"},
+    "debit": {"debit", "debitamount", "withdrawals", "amountdebited", "paidout", "out"},
+    "amount": {"amount", "transactionamount", "value", "netamount"},
+}
+
+_DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d-%b-%Y", "%d %b %Y",
+                 "%Y/%m/%d", "%m/%d/%Y", "%d.%m.%Y",
+                 "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M")
+
+
+def _parse_bank_date(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        raise BankStatementError("empty date")
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(raw).date().isoformat()
+    except ValueError:
+        raise BankStatementError(f"could not parse date '{raw}'")
+
+
+def _parse_amount_cents(raw):
+    s = (raw or "").strip().replace(",", "").replace("B$", "").replace("$", "")
+    if not s:
+        return 0
+    neg = s.startswith("(") and s.endswith(")")
+    s = s.strip("()").strip()
+    try:
+        return int(round(float(s) * 100)) * (-1 if neg else 1)
+    except ValueError:
+        raise BankStatementError(f"could not parse amount '{raw}'")
+
+
+def parse_bank_statement(text):
+    """Parse a bank statement CSV. Returns (transactions, skipped_rows).
+
+    Each transaction is a dict with posted_date, description, reference and
+    amount_cents. Only credits (money in) are returned; debits and fees are
+    skipped. Raises BankStatementError when the file structure is unusable.
+    """
+    reader = csv.reader(io.StringIO(text))
+    rows = [r for r in reader if any((c or "").strip() for c in r)]
+    if not rows:
+        raise BankStatementError("the file is empty")
+    header = [_norm_header(c) for c in rows[0]]
+    col = {}
+    for key, names in _BANK_COLS.items():
+        for i, h in enumerate(header):
+            if h in names and key not in col:
+                col[key] = i
+    if "date" not in col:
+        raise BankStatementError(
+            "could not find a date column (looked for Date / Posting Date / Value Date)")
+    if "amount" not in col and "credit" not in col:
+        raise BankStatementError(
+            "could not find an amount column (looked for Amount / Credit / Debit)")
+    desc_i = col.get("description")
+    ref_i = col.get("reference")
+
+    def cell(r, i):
+        return (r[i] if i is not None and i < len(r) else "").strip()
+
+    out, skipped = [], 0
+    for r in rows[1:]:
+        try:
+            if "amount" in col:
+                cents = _parse_amount_cents(cell(r, col["amount"]))
+            else:
+                # Debit is treated as a magnitude so both "5.00" and "-5.00"
+                # debit conventions net correctly against the credit.
+                cents = _parse_amount_cents(cell(r, col.get("credit"))) - \
+                        abs(_parse_amount_cents(cell(r, col.get("debit"))))
+            if cents <= 0:
+                continue  # debits, fees and zero rows are not dues
+            posted = _parse_bank_date(cell(r, col["date"]))
+        except BankStatementError:
+            skipped += 1
+            continue
+        out.append({
+            "posted_date": posted,
+            "description": cell(r, desc_i),
+            "reference": cell(r, ref_i),
+            "amount_cents": cents,
+        })
+    return out, skipped
+
+
+def bank_fingerprint(posted_date, amount_cents, description, reference):
+    raw = "|".join([posted_date, str(amount_cents),
+                    (description or "").strip(), (reference or "").strip()])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def find_member_by_reference(db, text):
+    """Match a statement line to a member by referral code or member-ID
+    pattern in the reference. Returns (user_row, 'code'|'id') or (None, None)."""
+    t = " " + (text or "").upper() + " "
+    for u in db.execute("SELECT id, referral_code FROM users WHERE is_admin = 0").fetchall():
+        code = (u["referral_code"] or "").upper()
+        if code and re.search(r"\b" + re.escape(code) + r"\b", t):
+            return db.execute("SELECT * FROM users WHERE id = ?", (u["id"],)).fetchone(), "code"
+    m = re.search(r"\b(?:WP|MEMBER|MEMBERID|ID|ACCT|ACCOUNT)[\s\-_#]*(\d{1,6})\b", t)
+    if not m:
+        m = re.search(r"#(\d{1,6})\b", t)
+    if m:
+        u = db.execute("SELECT * FROM users WHERE id = ? AND is_admin = 0",
+                       (int(m.group(1)),)).fetchone()
+        if u:
+            return u, "id"
+    return None, None
+
+
+def suggest_member_by_name(db, text):
+    """Best-effort name match for admin review (never auto-applied). Requires
+    the first and last name tokens to appear in the statement text and picks
+    the member with the most matching tokens."""
+    t = (text or "").lower()
+    best, best_score = None, 0
+    for u in db.execute("SELECT * FROM users WHERE is_admin = 0").fetchall():
+        parts = [p for p in u["name"].lower().split() if len(p) > 1]
+        if len(parts) < 2:
+            continue
+        if parts[0] not in t or parts[-1] not in t:
+            continue
+        score = sum(1 for p in parts if p in t)
+        if score > best_score:
+            best, best_score = u, score
+    return best
+
+
+def apply_bank_payment(db, txn_id, user_id, amount_cents, period_days=30):
+    """Activate/extend a membership from a matched bank transaction. The
+    payment is recorded with status 'bank_transfer' and the referrer is
+    credited exactly like a Stripe payment."""
+    txn = db.execute("SELECT * FROM bank_transactions WHERE id = ?", (txn_id,)).fetchone()
+    if txn is None or txn["status"] == "matched":
+        return None
+    activate_membership(
+        db, user_id, period_days=period_days, amount_cents=amount_cents,
+        payment_status="bank_transfer",
+        payment_reference=f"BOB:{txn['fingerprint'][:12]}",
+    )
+    pay = db.execute(
+        "SELECT id FROM payments WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (user_id,)).fetchone()
+    db.execute(
+        """UPDATE bank_transactions SET status = 'matched', matched_user_id = ?,
+           payment_id = ?, suggested_user_id = NULL WHERE id = ?""",
+        (user_id, pay["id"] if pay else None, txn_id),
+    )
+    db.commit()
+    return pay["id"] if pay else None
+
+
+def auto_match_bank_txn(db, txn):
+    """Attempt automatic matching. Returns 'matched', 'needs_review' or 'pending'."""
+    text = f"{txn['description']} {txn['reference']}"
+    if txn["amount_cents"] == MONTHLY_PRICE_CENTS:
+        user, _how = find_member_by_reference(db, text)
+        if user:
+            apply_bank_payment(db, txn["id"], user["id"], txn["amount_cents"], period_days=30)
+            return "matched"
+        sug = suggest_member_by_name(db, text)
+        if sug:
+            db.execute(
+                "UPDATE bank_transactions SET status = 'needs_review', suggested_user_id = ? WHERE id = ?",
+                (sug["id"], txn["id"]),
+            )
+            db.commit()
+            return "needs_review"
+    return "pending"
+
+
+def _bank_txn_row(t):
+    return {
+        "id": t["id"],
+        "posted_date": t["posted_date"],
+        "description": t["description"],
+        "reference": t["reference"],
+        "amount_cents": t["amount_cents"],
+        "currency": t["currency"],
+        "status": t["status"],
+        "matched_user_id": t["matched_user_id"],
+        "matched_name": t["matched_name"],
+        "suggested_user_id": t["suggested_user_id"],
+        "suggested_name": t["suggested_name"],
+        "payment_id": t["payment_id"],
+        "import_id": t["import_id"],
+    }
+
+
+@app.route("/api/admin/bank/import", methods=["POST"])
+@admin_required
+def admin_bank_import():
+    f = request.files.get("file")
+    if f is None:
+        return jsonify({"error": "no file uploaded (form field 'file')"}), 400
+    try:
+        text = f.read().decode("utf-8-sig")
+    except Exception:
+        return jsonify({"error": "could not read the file as text (expected CSV)"}), 400
+    try:
+        parsed, skipped = parse_bank_statement(text)
+    except BankStatementError as exc:
+        return jsonify({"error": str(exc)}), 400
+    db = get_db()
+    cur = db.execute(
+        "INSERT INTO bank_imports (filename, imported_by, created_at) VALUES (?, ?, ?)",
+        (f.filename or "statement.csv", g.current_user["id"], now_iso()),
+    )
+    import_id = cur.lastrowid
+    new_count = matched_count = dup_count = 0
+    for p in parsed:
+        fp = bank_fingerprint(p["posted_date"], p["amount_cents"],
+                              p["description"], p["reference"])
+        if db.execute("SELECT id FROM bank_transactions WHERE fingerprint = ?", (fp,)).fetchone():
+            dup_count += 1
+            continue
+        cur = db.execute(
+            """INSERT INTO bank_transactions
+               (import_id, posted_date, description, reference, amount_cents,
+                currency, fingerprint, status, created_at)
+               VALUES (?, ?, ?, ?, ?, 'BSD', ?, 'pending', ?)""",
+            (import_id, p["posted_date"], p["description"], p["reference"],
+             p["amount_cents"], fp, now_iso()),
+        )
+        new_count += 1
+        txn = db.execute("SELECT * FROM bank_transactions WHERE id = ?",
+                         (cur.lastrowid,)).fetchone()
+        if auto_match_bank_txn(db, txn) == "matched":
+            matched_count += 1
+    db.execute(
+        """UPDATE bank_imports SET txn_count = ?, new_count = ?, matched_count = ?
+           WHERE id = ?""",
+        (len(parsed), new_count, matched_count, import_id),
+    )
+    db.commit()
+    return jsonify({
+        "import_id": import_id,
+        "parsed_credits": len(parsed),
+        "new_transactions": new_count,
+        "duplicates_skipped": dup_count,
+        "auto_matched": matched_count,
+        "unparseable_rows_skipped": skipped,
+    })
+
+
+@app.route("/api/admin/bank/transactions")
+@admin_required
+def admin_bank_transactions():
+    db = get_db()
+    status = request.args.get("status", "").strip()
+    q = """SELECT t.*, u.name AS matched_name, s.name AS suggested_name
+           FROM bank_transactions t
+           LEFT JOIN users u ON u.id = t.matched_user_id
+           LEFT JOIN users s ON s.id = t.suggested_user_id"""
+    args = ()
+    if status in ("pending", "needs_review", "matched", "ignored"):
+        q += " WHERE t.status = ?"
+        args = (status,)
+    q += " ORDER BY t.posted_date DESC, t.id DESC LIMIT 500"
+    rows = db.execute(q, args).fetchall()
+    return jsonify([_bank_txn_row(t) for t in rows])
+
+
+@app.route("/api/admin/bank/transactions/<int:txn_id>/match", methods=["POST"])
+@admin_required
+def admin_bank_match(txn_id):
+    db = get_db()
+    txn = db.execute("SELECT * FROM bank_transactions WHERE id = ?", (txn_id,)).fetchone()
+    if txn is None:
+        return jsonify({"error": "transaction not found"}), 404
+    if txn["status"] == "matched":
+        return jsonify({"error": "transaction is already matched"}), 400
+    data = request.get_json(force=True, silent=True) or {}
+    user = None
+    if data.get("user_id"):
+        try:
+            user = db.execute("SELECT * FROM users WHERE id = ? AND is_admin = 0",
+                              (int(data["user_id"]),)).fetchone()
+        except (TypeError, ValueError):
+            user = None
+    elif data.get("email"):
+        user = db.execute("SELECT * FROM users WHERE email = ? AND is_admin = 0",
+                          (data["email"].strip().lower(),)).fetchone()
+    if user is None:
+        return jsonify({"error": "member not found (pass user_id or email)"}), 404
+    months = max(1, round(txn["amount_cents"] / MONTHLY_PRICE_CENTS))
+    payment_id = apply_bank_payment(db, txn_id, user["id"], txn["amount_cents"],
+                                    period_days=30 * months)
+    return jsonify({"ok": True, "user_id": user["id"],
+                    "name": user["name"], "payment_id": payment_id,
+                    "months_credited": months})
+
+
+@app.route("/api/admin/bank/transactions/<int:txn_id>/ignore", methods=["POST"])
+@admin_required
+def admin_bank_ignore(txn_id):
+    db = get_db()
+    txn = db.execute("SELECT * FROM bank_transactions WHERE id = ?", (txn_id,)).fetchone()
+    if txn is None:
+        return jsonify({"error": "transaction not found"}), 404
+    if txn["status"] == "matched":
+        return jsonify({"error": "a matched transaction cannot be ignored"}), 400
+    db.execute("UPDATE bank_transactions SET status = 'ignored' WHERE id = ?", (txn_id,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/bank/dues")
+@admin_required
+def admin_bank_dues():
+    """Members whose dues are overdue or due within 7 days — the dunning list."""
+    db = get_db()
+    soon = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+    rows = db.execute(
+        """SELECT u.id, u.name, u.email, u.membership_status, u.membership_period_end,
+                  (SELECT MAX(p.created_at) FROM payments p
+                   WHERE p.user_id = u.id
+                   AND p.status IN ('succeeded', 'simulated', 'bank_transfer')) AS last_paid_at,
+                  (SELECT p.status FROM payments p
+                   WHERE p.user_id = u.id
+                   ORDER BY p.created_at DESC LIMIT 1) AS last_payment_status
+           FROM users u
+           WHERE u.is_admin = 0
+             AND (u.membership_status != 'active'
+                  OR u.membership_period_end IS NULL
+                  OR u.membership_period_end < ?)
+           ORDER BY u.membership_period_end""",
+        (soon,),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 # ---- projects ----
