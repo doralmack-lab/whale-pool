@@ -294,9 +294,114 @@ W.wise.WISE_API_TOKEN = ""
 res = W.wise.run_payout("loan_disbursement", 500000, "USD", "USD", "Founder", {}, "cid-2")
 check("unconfigured wise stays simulated", res["status"] == "simulated", res)
 
+# --- bank transfer reconciliation (BOB statement import) ---
+import io as _io
+
+b1 = register("Bank Member One", "bank1@t.test", ref=founder_code)
+b1_code = b1["user"]["referral_code"]
+b2 = register("Bank Member Two", "bank2@t.test")
+register("Dues Member", "dues@t.test")  # never pays -> should appear in dues list
+
+bank_csv = f"""Posting Date,Description,Reference,Credit,Debit
+2026-09-01,TRF FROM Bank Member One,{b1_code},30.00,
+2026-09-02,TRF FROM Bank Member Two,,30.00,
+2026-09-03,TRF FROM Someone Else,UNKNOWNREF,45.00,
+2026-09-04,BANK SERVICE CHARGE,,,-5.00
+"""
+
+def bank_import(csv_text, name="stmt.csv"):
+    data = {"file": (_io.BytesIO(csv_text.encode()), name)}
+    return client.post("/api/admin/bank/import", data=data,
+                       content_type="multipart/form-data",
+                       headers={"Authorization": f"Bearer {admin_tok}"})
+
+with W.app.app_context():
+    db = W.get_db()
+    founder_before = db.execute(
+        "SELECT referral_credits_cents FROM users WHERE email='founder@t.test'").fetchone()["referral_credits_cents"]
+
+r = bank_import(bank_csv)
+check("bank import accepts CSV", r.status_code == 200, r.status_code)
+d = r.get_json()
+check("import parsed 3 credits (debit skipped)", d["parsed_credits"] == 3, d)
+check("import added 3 new transactions", d["new_transactions"] == 3, d)
+check("import auto-matched 1 by referral code", d["auto_matched"] == 1, d)
+check("no duplicates on first import", d["duplicates_skipped"] == 0, d)
+
+with W.app.app_context():
+    db = W.get_db()
+    u1 = db.execute("SELECT * FROM users WHERE email='bank1@t.test'").fetchone()
+    check("auto-match activated membership", u1["membership_status"] == "active", u1["membership_status"])
+    pay = db.execute("SELECT * FROM payments WHERE user_id=? ORDER BY id DESC LIMIT 1",
+                     (u1["id"],)).fetchone()
+    check("bank payment recorded at $30", pay["amount_cents"] == 3000, pay["amount_cents"])
+    check("bank payment status is bank_transfer", pay["status"] == "bank_transfer", pay["status"])
+    check("bank payment reference traces to statement",
+          (pay["stripe_payment_id"] or "").startswith("BOB:"), pay["stripe_payment_id"])
+    txn = db.execute("SELECT * FROM bank_transactions WHERE matched_user_id=?", (u1["id"],)).fetchone()
+    check("transaction marked matched", txn["status"] == "matched" and txn["payment_id"] == pay["id"])
+    founder_after = db.execute(
+        "SELECT referral_credits_cents FROM users WHERE email='founder@t.test'").fetchone()["referral_credits_cents"]
+    check("bank payment credits referrer $10", founder_after - founder_before == 1000,
+          f"{founder_before}->{founder_after}")
+
+# re-import is idempotent
+r = bank_import(bank_csv)
+d = r.get_json()
+check("re-import adds nothing", d["new_transactions"] == 0 and d["duplicates_skipped"] == 3, d)
+
+# name-only match goes to review, then manual confirm by email
+r = client.get("/api/admin/bank/transactions?status=needs_review",
+               headers={"Authorization": f"Bearer {admin_tok}"})
+txs = r.get_json()
+check("name match flagged for review", len(txs) == 1 and txs[0]["suggested_name"] == "Bank Member Two", txs)
+tid = txs[0]["id"]
+r = client.post(f"/api/admin/bank/transactions/{tid}/match", json={"email": "bank2@t.test"},
+                headers={"Authorization": f"Bearer {admin_tok}"})
+check("manual match by email works", r.status_code == 200 and r.get_json()["months_credited"] == 1,
+      r.get_json())
+with W.app.app_context():
+    db = W.get_db()
+    u2 = db.execute("SELECT * FROM users WHERE email='bank2@t.test'").fetchone()
+    check("manual match activated membership", u2["membership_status"] == "active")
+
+# non-dues amount stays pending; manual match grants multiple months
+r = client.get("/api/admin/bank/transactions?status=pending",
+               headers={"Authorization": f"Bearer {admin_tok}"})
+pend = r.get_json()
+check("unknown reference stays pending", len(pend) == 1 and pend[0]["amount_cents"] == 4500, pend)
+mm = register("Multi Month", "multimonth@t.test")
+with W.app.app_context():
+    db = W.get_db()
+    mmid = db.execute("SELECT id FROM users WHERE email='multimonth@t.test'").fetchone()["id"]
+r = client.post(f"/api/admin/bank/transactions/{pend[0]['id']}/match", json={"user_id": mmid},
+                headers={"Authorization": f"Bearer {admin_tok}"})
+check("$45 payment grants 2 months", r.get_json()["months_credited"] == 2, r.get_json())
+
+# dues / dunning list
+r = client.get("/api/admin/bank/dues", headers={"Authorization": f"Bearer {admin_tok}"})
+dues = r.get_json()
+dues_emails = {x["email"] for x in dues}
+check("never-paid member is on dues list", "dues@t.test" in dues_emails, dues_emails)
+check("active bank payer is not on dues list",
+      "bank1@t.test" not in dues_emails and "bank2@t.test" not in dues_emails, dues_emails)
+
+# member-facing billing status exposes bank instructions
+r = auth_get(b1["token"], "/api/billing/status")
+bd = r.get_json()["bank_transfer"]
+check("billing status has bank transfer block", bd["enabled"] is True and bd["amount_cents"] == 3000, bd)
+check("bank reference is the member code", bd["reference"] == b1_code, bd["reference"])
+
+# unusable CSV is rejected with a clear error
+r = bank_import("foo,bar\n1,2\n", name="bad.csv")
+check("bad CSV rejected", r.status_code == 400 and "date" in r.get_json()["error"].lower(),
+      r.get_json())
+
 js = open("static/app.js").read()
 check("admin UI has payouts tab", 'data-t="payouts"' in js)
 check("payouts tab hits payouts API", "/api/admin/payouts" in js)
+check("admin UI has bank tab", 'data-t="bank"' in js)
+check("bank tab hits import API", "/api/admin/bank/import" in js)
 
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 sys.exit(1 if failed else 0)
